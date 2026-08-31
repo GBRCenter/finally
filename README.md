@@ -32,7 +32,7 @@ cp .env.example .env
 
 # Run with Docker
 docker build -t finally .
-docker run -v finally-data:/app/db -p 8000:8000 --env-file .env finally
+docker run -v "$(pwd)/db:/app/db" -p 8000:8000 --env-file .env finally
 
 # Open http://localhost:8000
 ```
