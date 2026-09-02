@@ -33,7 +33,6 @@ def _make_snapshot_without_trade(ticker: str) -> TickerSnapshot:
     return TickerSnapshot.from_dict({"ticker": ticker})
 
 
-@pytest.mark.asyncio
 class TestApplySnapshots:
     """Tests for the extracted, directly-testable parse method."""
 
