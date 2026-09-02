@@ -4,14 +4,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 from massive import RESTClient
+from massive.exceptions import AuthError, BadResponse
 from massive.rest.models import SnapshotMarketType
 
 from .cache import PriceCache
 from .interface import MarketDataSource
 
 logger = logging.getLogger(__name__)
+
+# Snapshot last_trade.sip_timestamp is Unix nanoseconds; PriceCache wants seconds.
+NANOS_PER_SECOND = 1_000_000_000
 
 
 class MassiveDataSource(MarketDataSource):
@@ -95,30 +100,42 @@ class MassiveDataSource(MarketDataSource):
             # The Massive RESTClient is synchronous — run in a thread to
             # avoid blocking the event loop.
             snapshots = await asyncio.to_thread(self._fetch_snapshots)
-            processed = 0
-            for snap in snapshots:
-                try:
-                    price = snap.last_trade.price
-                    # Massive timestamps are Unix milliseconds → convert to seconds
-                    timestamp = snap.last_trade.timestamp / 1000.0
-                    self._cache.update(
-                        ticker=snap.ticker,
-                        price=price,
-                        timestamp=timestamp,
-                    )
-                    processed += 1
-                except (AttributeError, TypeError) as e:
-                    logger.warning(
-                        "Skipping snapshot for %s: %s",
-                        getattr(snap, "ticker", "???"),
-                        e,
-                    )
-            logger.debug("Massive poll: updated %d/%d tickers", processed, len(self._tickers))
+        except AuthError:
+            logger.error("Massive API key rejected — the source does not fall back automatically")
+            raise  # unrecoverable: do not retry on a loop
+        except BadResponse as e:
+            logger.warning("Massive returned an error response: %s", e)
+            return  # transient: retry next interval
+        except Exception:
+            logger.exception("Massive poll failed")
+            return
 
-        except Exception as e:
-            logger.error("Massive poll failed: %s", e)
-            # Don't re-raise — the loop will retry on the next interval.
-            # Common failures: 401 (bad key), 429 (rate limit), network errors.
+        processed = self._apply_snapshots(snapshots)
+        logger.debug("Massive poll: updated %d/%d tickers", processed, len(self._tickers))
+
+    def _apply_snapshots(self, snapshots: list) -> int:
+        """Write snapshot data into the cache. Returns the number of tickers updated.
+
+        Extracted from _poll_once so it can be tested directly against real
+        `TickerSnapshot` objects (built via `TickerSnapshot.from_dict(...)`)
+        instead of mocks that would silently accept a misspelled attribute.
+        """
+        processed = 0
+        for snap in snapshots:
+            trade = snap.last_trade
+            if trade is None or trade.price is None:
+                # No trade yet today (pre-market, or an unrecognized symbol
+                # that still made it into the response) — leave it as "—".
+                continue
+            self._cache.update(
+                ticker=snap.ticker,
+                price=trade.price,
+                timestamp=(
+                    trade.sip_timestamp / NANOS_PER_SECOND if trade.sip_timestamp else time.time()
+                ),
+            )
+            processed += 1
+        return processed
 
     def _fetch_snapshots(self) -> list:
         """Synchronous call to the Massive REST API. Runs in a thread."""
