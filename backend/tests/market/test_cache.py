@@ -96,6 +96,13 @@ class TestPriceCache:
         update = cache.update("AAPL", 190.50, timestamp=custom_ts)
         assert update.timestamp == custom_ts
 
+    def test_epoch_zero_timestamp_is_not_replaced(self):
+        """timestamp=0.0 is falsy but a legitimate Unix epoch instant --
+        an `or` check would wrongly substitute time.time() for it."""
+        cache = PriceCache()
+        update = cache.update("AAPL", 190.50, timestamp=0.0)
+        assert update.timestamp == 0.0
+
     def test_price_rounding(self):
         """Test that prices are rounded to 2 decimal places."""
         cache = PriceCache()

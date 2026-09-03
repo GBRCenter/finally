@@ -9,6 +9,7 @@ how the shipped code's `last_trade.timestamp` bug (the real attribute is
 model shape.
 """
 
+import asyncio
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -248,3 +249,51 @@ class TestMassiveDataSourcePolling:
         assert cache.get_price("AAPL") == 190.50
 
         await source.stop()
+
+    async def test_is_healthy_true_after_a_normal_start(self):
+        cache = PriceCache()
+        source = MassiveDataSource(api_key="test-key", price_cache=cache, poll_interval=60.0)
+
+        with patch("app.market.massive_client.RESTClient"):
+            with patch.object(source, "_fetch_snapshots", return_value=[]):
+                await source.start(["AAPL"])
+
+        assert source.is_healthy is True
+        await source.stop()
+
+    async def test_is_healthy_survives_a_deliberate_stop(self):
+        """Cancelling the task via stop() must not be mistaken for a crash."""
+        cache = PriceCache()
+        source = MassiveDataSource(api_key="test-key", price_cache=cache, poll_interval=10.0)
+
+        with patch("app.market.massive_client.RESTClient"):
+            with patch.object(source, "_fetch_snapshots", return_value=[]):
+                await source.start(["AAPL"])
+
+        await source.stop()
+        assert source.is_healthy is True
+
+    async def test_is_healthy_flips_false_when_the_poll_loop_dies(self):
+        """A revoked key raising AuthError mid-loop must flip the health flag,
+        not just die silently until someone happens to await the task."""
+        cache = PriceCache()
+        source = MassiveDataSource(api_key="test-key", price_cache=cache, poll_interval=0.01)
+
+        with patch("app.market.massive_client.RESTClient"):
+            with patch.object(source, "_fetch_snapshots", return_value=[]):
+                await source.start(["AAPL"])
+
+        assert source.is_healthy is True
+
+        with patch.object(source, "_fetch_snapshots", side_effect=AuthError("revoked")):
+            # Let the loop wake up, poll, raise, and have its done-callback fire.
+            for _ in range(20):
+                if not source.is_healthy:
+                    break
+                await asyncio.sleep(0.01)
+
+        assert source.is_healthy is False
+        assert source._task.done()
+
+        # Cleanup: the task already died, stop() must still be a safe no-op path.
+        source._task = None

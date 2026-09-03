@@ -42,6 +42,13 @@ class MassiveDataSource(MarketDataSource):
         self._tickers: list[str] = []
         self._task: asyncio.Task | None = None
         self._client: RESTClient | None = None
+        # Flipped to False if the poll loop dies (e.g. a revoked API key
+        # raising AuthError after start() already succeeded). Nothing awaits
+        # self._task until stop(), so without this the failure would only
+        # ever surface as an unretrieved-exception log at GC time. A future
+        # GET /api/health can report `market_source` as degraded by reading
+        # this flag.
+        self._healthy = True
 
     async def start(self, tickers: list[str]) -> None:
         self._client = RESTClient(api_key=self._api_key)
@@ -50,7 +57,9 @@ class MassiveDataSource(MarketDataSource):
         # Do an immediate first poll so the cache has data right away
         await self._poll_once()
 
+        self._healthy = True
         self._task = asyncio.create_task(self._poll_loop(), name="massive-poller")
+        self._task.add_done_callback(self._on_poll_task_done)
         logger.info(
             "Massive poller started: %d tickers, %.1fs interval",
             len(tickers),
@@ -83,7 +92,30 @@ class MassiveDataSource(MarketDataSource):
     def get_tickers(self) -> list[str]:
         return list(self._tickers)
 
+    @property
+    def is_healthy(self) -> bool:
+        """False once the poll loop has died from an unhandled exception.
+
+        A deliberate stop() (which cancels the task) never flips this.
+        """
+        return self._healthy
+
     # --- Internal ---
+
+    def _on_poll_task_done(self, task: asyncio.Task) -> None:
+        """Surface a dead poll loop loudly instead of an easy-to-miss
+        "Task exception was never retrieved" log at garbage-collection time.
+        """
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            self._healthy = False
+            logger.critical(
+                "Massive poller task died unexpectedly, live prices are now frozen: %s",
+                exc,
+                exc_info=exc,
+            )
 
     async def _poll_loop(self) -> None:
         """Poll on interval. First poll already happened in start()."""

@@ -14,7 +14,7 @@ import pytest
 
 import app.market.stream as stream_module
 from app.market.cache import HISTORY_MAXLEN, PriceCache
-from app.market.stream import _generate_events, create_history_router
+from app.market.stream import _generate_events, create_history_router, create_stream_router
 
 
 class FakeClient:
@@ -40,6 +40,29 @@ def _history_endpoint(cache: PriceCache):
     """Grab the just-registered endpoint closure without a live ASGI app."""
     router = create_history_router(cache)
     return router.routes[-1].endpoint
+
+
+class TestRouterFactoriesReturnFreshRouters:
+    """Repeated calls (e.g. an `app` fixture rebuilt per test) must not
+    accumulate duplicate routes on shared module-level router state."""
+
+    def test_create_stream_router_does_not_share_routes_across_calls(self):
+        cache = PriceCache()
+        first = create_stream_router(cache)
+        second = create_stream_router(cache)
+
+        assert first is not second
+        assert len(first.routes) == 1
+        assert len(second.routes) == 1
+
+    def test_create_history_router_does_not_share_routes_across_calls(self):
+        cache = PriceCache()
+        first = create_history_router(cache)
+        second = create_history_router(cache)
+
+        assert first is not second
+        assert len(first.routes) == 1
+        assert len(second.routes) == 1
 
 
 @pytest.mark.asyncio

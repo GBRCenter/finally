@@ -15,9 +15,6 @@ from .cache import HISTORY_MAXLEN, PriceCache
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/stream", tags=["streaming"])
-history_router = APIRouter(prefix="/api/prices", tags=["prices"])
-
 # How long the cache version can go unchanged before we send an SSE comment
 # line to keep the connection (and proxies in between) from timing it out.
 KEEPALIVE_SECONDS = 15.0
@@ -26,8 +23,12 @@ KEEPALIVE_SECONDS = 15.0
 def create_stream_router(price_cache: PriceCache) -> APIRouter:
     """Create the SSE streaming router with a reference to the price cache.
 
-    This factory pattern lets us inject the PriceCache without globals.
+    This factory pattern lets us inject the PriceCache without globals. A
+    fresh APIRouter is built on every call so that constructing the app more
+    than once per process (a common pytest fixture pattern) never appends
+    duplicate routes to shared module state.
     """
+    router = APIRouter(prefix="/api/stream", tags=["streaming"])
 
     @router.get("/prices")
     async def stream_prices(request: Request) -> StreamingResponse:
@@ -57,9 +58,11 @@ def create_stream_router(price_cache: PriceCache) -> APIRouter:
 def create_history_router(price_cache: PriceCache) -> APIRouter:
     """Create the router serving rolling in-memory price history.
 
-    Factory pattern mirrors create_stream_router so the PriceCache is
-    injected without module-level globals.
+    Factory pattern mirrors create_stream_router: a fresh APIRouter is built
+    on every call so the PriceCache is injected without module-level globals
+    that would accumulate duplicate routes across repeated app construction.
     """
+    history_router = APIRouter(prefix="/api/prices", tags=["prices"])
 
     @history_router.get("/{ticker}/history")
     async def get_price_history(ticker: str, limit: int = HISTORY_MAXLEN) -> dict:
