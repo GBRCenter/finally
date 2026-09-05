@@ -41,6 +41,16 @@ uv run pytest -v
 
 - `MASSIVE_API_KEY` - Optional. If set, use real market data from Massive API. If not set, use the built-in simulator.
 
+## Market Data Demo
+
+A Rich terminal dashboard for eyeballing the live simulator — all 10 default tickers with
+color-coded price/change, sparklines, an event log for notable moves (>1%), and a session
+summary on exit. Runs for 60 seconds or until Ctrl+C.
+
+```bash
+uv run market_data_demo.py
+```
+
 ## Development
 
 ```bash
