@@ -1,173 +1,242 @@
 # Market Data Backend — Code Review
 
-**Date:** 2026-02-10
-**Scope:** `backend/app/market/` (8 source files) and `backend/tests/market/` (6 test files)
+**Date:** 2026-09-02
+**Scope:** `backend/app/market/` (8 source files, 730 LOC) and `backend/tests/market/` (7 test files, 1,161 LOC)
+**Reviewer:** Claude, in response to issue #5
 
 ---
 
-## 1. Test Results Summary
+## 1. Test Execution — Could Not Run
 
-**73 tests collected, 68 passed, 5 failed.**
+This review's environment does not have permission to execute shell commands that
+run the Python interpreter or install dependencies (`uv sync`, `uv run pytest`, even
+`python3 -c ...` are all blocked pending approval, and this run has no human
+available to approve them). This is the same limitation `planning/MARKET_DATA_SUMMARY.md`
+recorded on the previous pass. **No test was executed as part of this review.**
 
-All failures are in `test_massive.py` and stem from the same root cause: the `massive` package is not installed in the test environment, so `patch("app.market.massive_client.RESTClient")` fails with `AttributeError` because the module-level name `RESTClient` was never imported (it is lazy-imported inside methods). This is an environment issue, not a logic bug — the tests are correctly structured but require the `massive` package to be available (or `create=True` on the patch) so that the mock target exists.
+To get a real pass/fail signal, re-run this task with `Bash(uv sync:*)` and
+`Bash(uv run:*)` added to the allowed tools, or run locally:
 
-Failing tests:
-- `test_poll_updates_cache` — `asyncio.to_thread` fails because `_fetch_snapshots` is not properly mocked when `massive` is absent
-- `test_malformed_snapshot_skipped` — same cause
-- `test_timestamp_conversion` — same cause
-- `test_stop_cancels_task` — `patch("app.market.massive_client.RESTClient")` fails because the name doesn't exist at module level
-- `test_start_immediate_poll` — same as above
+```bash
+cd backend
+uv sync --extra dev
+uv run --extra dev pytest -v --cov=app --cov-report=term-missing
+uv run --extra dev ruff check app/ tests/
+```
 
-The underlying `_poll_once()` logic itself is correct. The 3 tests that mock `source._fetch_snapshots` directly fail because `asyncio.to_thread(self._fetch_snapshots)` calls the real method which tries to import `massive`. The 2 tests that use `patch("app.market.massive_client.RESTClient")` fail because the name doesn't exist in the module's namespace (lazy import). Both issues resolve when the `massive` package is installed.
+In place of execution, every test file was read in full and traced by hand against
+the source it exercises (see §4). All 96 tests found in the suite exercise real
+code paths correctly as far as static reading can confirm — no test asserts on
+behavior the source doesn't actually implement, and no test's mocking hides a
+divergence between the mock's shape and the real one (the concern that let a
+prior bug through at 94% coverage, per `test_massive.py`'s own docstring).
 
-**Lint (ruff):** Source code passes clean. Tests have 5 unused-import warnings (`pytest`, `math`, `asyncio` imported but not used in some test files).
-
-**Coverage:** 84% overall.
-| Module | Coverage | Notes |
-|---|---|---|
-| models.py | 100% | |
-| cache.py | 100% | |
-| interface.py | 100% | |
-| seed_prices.py | 100% | |
-| factory.py | 100% | |
-| simulator.py | 98% | Uncovered: `_add_ticker_internal` duplicate guard (L145), exception log in `_run_loop` (L264-265) |
-| massive_client.py | 56% | Expected — real API methods can't run without the massive package |
-| stream.py | 31% | Expected — SSE generator requires a running ASGI server to test |
+**Test count:** 96 across 7 files (`test_models.py` 11, `test_cache.py` 24,
+`test_simulator.py` 17, `test_simulator_source.py` 10, `test_factory.py` 7,
+`test_massive.py` 17, `test_stream.py` 15 by count of `def test_`/`async def test_`
+— slightly higher than the 94 recorded in `MARKET_DATA_SUMMARY.md` §"Test Suite",
+consistent with incremental additions since that doc was last updated).
 
 ---
 
 ## 2. Architecture Assessment
 
-The market data subsystem is well-designed. It follows a clean strategy pattern:
+The module is well-factored and matches `planning/MARKET_DATA_DESIGN.md` and
+`planning/MARKET_DATA_SUMMARY.md` closely:
 
 ```
 MarketDataSource (ABC)
-├── SimulatorDataSource  (GBM simulator)
-└── MassiveDataSource    (Polygon.io REST poller)
+├── SimulatorDataSource  →  GBMSimulator (Cholesky-correlated GBM)
+└── MassiveDataSource    →  Polygon.io REST poller
         │
         ▼
-   PriceCache (shared, thread-safe)
+   PriceCache (thread-safe, latest price + 600-point rolling history)
         │
-        ▼
-   SSE stream → Frontend
+        ├──→ create_stream_router()  → GET /api/stream/prices (SSE, with keepalive)
+        └──→ create_history_router() → GET /api/prices/{ticker}/history
 ```
 
-**Strengths:**
-- Clear separation of concerns across 8 focused modules
-- Factory pattern with lazy imports — the `massive` package is only needed when `MASSIVE_API_KEY` is set
-- PriceCache as the single point of truth decouples producers from consumers
-- Immutable `PriceUpdate` dataclass with `frozen=True, slots=True` is correct and efficient
-- The GBM math is proper: log-normal price paths via `exp((mu - 0.5*sigma^2)*dt + sigma*sqrt(dt)*Z)`
-- Correlated moves via Cholesky decomposition are a nice touch for realism
-- All background tasks are properly cancellable and idempotent on stop()
+**Strengths confirmed by this pass:**
+
+- Strategy pattern cleanly isolates the two data sources behind `MarketDataSource`; nothing downstream needs to know which is active.
+- `PriceUpdate` is `frozen=True, slots=True` — correct choice for a value object shared across threads/tasks.
+- `PriceCache` centralizes all locking (`threading.Lock`) around the one mutable structure producers and consumers touch; the API surface (`update`, `get`, `get_all`, `get_price`, `remove`, `get_history`) is small and each method acquires the lock exactly once.
+- The GBM math is textbook-correct log-normal price evolution, and the `dt` sizing (`0.5s / (252 * 6.5h * 3600s)`) is derived, not guessed, with the derivation left in a comment.
+- Cholesky-based correlated draws (`simulator.py:84-90`) are a genuinely nice touch for a simulator whose only job is to look convincing on a chart.
+- The three TODOs recorded as open in `PLAN.md` §13 (SSE keepalive, rolling history, `/history` endpoint) are all implemented and each has direct test coverage (`test_stream.py`).
+- The two defects `MARKET_DATA_DESIGN.md` §8.4 recorded against the Massive client (wrong attribute name, nanoseconds-as-milliseconds) are fixed in `massive_client.py:130-136`, and `test_massive.py` deliberately builds real `TickerSnapshot` objects via `TickerSnapshot.from_dict(...)` rather than `MagicMock`, which is exactly the right defense against that class of bug recurring silently.
+- `pyproject.toml` already has `[tool.hatch.build.targets.wheel] packages = ["app"]` — the "High" build-breaking bug from the archived 2026-02-10 review (`planning/archive/MARKET_DATA_REVIEW.md` §3.1) is fixed.
+- `massive` is a top-level import now (`massive_client.py:9-11`), not a lazy one — the archived review's §3.2 concern about tests being fragile without the package installed no longer applies; `pyproject.toml` lists it as a core dependency.
 
 ---
 
 ## 3. Issues Found
 
-### 3.1 Build Configuration Bug (Severity: High)
+### 3.1 `create_stream_router` / `create_history_router` mutate a shared module-level router (Severity: Medium)
 
-`pyproject.toml` is missing the hatchling package discovery configuration. Running `uv sync` fails:
-
-```
-ValueError: Unable to determine which files to ship inside the wheel
-```
-
-**Fix:** Add to `pyproject.toml`:
-```toml
-[tool.hatch.build.targets.wheel]
-packages = ["app"]
-```
-
-This will block Docker builds and any fresh `uv sync` until fixed.
-
-### 3.2 Massive Test Fragility (Severity: Medium)
-
-Five tests in `test_massive.py` fail when the `massive` package is not installed. The root cause is twofold:
-
-1. **`_poll_once` uses `asyncio.to_thread(self._fetch_snapshots)`** — even when `_fetch_snapshots` is patched on the instance, `to_thread` runs it in a thread executor. Three tests mock `_fetch_snapshots` as a `MagicMock` (synchronous), but `asyncio.to_thread` wraps it in `loop.run_in_executor`, which works... except that when `_fetch_snapshots` is NOT patched, the real method tries `from massive.rest.models import SnapshotMarketType` and fails.
-
-2. **`patch("app.market.massive_client.RESTClient")`** targets a name that doesn't exist at module level because `massive_client.py` uses a lazy import inside `start()`. The patch needs `create=True` or the import needs to be at module level behind a `TYPE_CHECKING` guard.
-
-These tests pass when `massive>=1.0.0` is installed (as `pyproject.toml` declares it as a core dependency), so this is technically a test-environment issue, not a code bug. However, since the whole point of lazy imports is to make `massive` optional for simulator-only use, the tests should also work without it.
-
-### 3.3 `_generate_events` Return Type Annotation (Severity: Low)
-
-`stream.py:54` declares the return type as `-> None` but the function is an async generator (it uses `yield`). The correct annotation would be `-> AsyncGenerator[str, None]` or simply removing the annotation. This doesn't cause runtime issues but is misleading for type checkers and developers.
-
-### 3.4 `version` Property Not Under Lock (Severity: Low)
-
-`PriceCache.version` reads `self._version` without acquiring `self._lock`:
+`stream.py:18-19` defines `router` and `history_router` at module scope. Both
+factory functions register their route via a closure on these **same shared
+objects** rather than creating a fresh `APIRouter()` per call:
 
 ```python
-@property
-def version(self) -> int:
-    return self._version
+router = APIRouter(prefix="/api/stream", tags=["streaming"])
+history_router = APIRouter(prefix="/api/prices", tags=["prices"])
+
+def create_stream_router(price_cache: PriceCache) -> APIRouter:
+    @router.get("/prices")
+    async def stream_prices(request: Request) -> StreamingResponse:
+        ...
+    return router
 ```
 
-On CPython with the GIL, reading a single `int` is atomic, so this won't cause corruption. However, it's inconsistent with the rest of the class, and if the project ever runs on a no-GIL Python build (PEP 703, Python 3.13t+), this could become a race. A minor concern given the current context.
+Calling either factory more than once appends another route to the same
+underlying router rather than returning an independent one. This was flagged
+as a "latent footgun for testing" in the archived review (§3.6) when there
+were no tests exercising it; now there are, and it is no longer latent:
+`test_stream.py`'s `_history_endpoint()` helper calls `create_history_router(cache)`
+fresh in **six different tests**, so `history_router` in the running test
+process accumulates six duplicate `/{ticker}/history` routes by the end of
+the file. The tests still pass because they grab `router.routes[-1].endpoint`
+— the most recently registered one — but this only works by coincidence of
+ordering, not because the router is actually being rebuilt.
 
-### 3.5 `SimulatorDataSource.get_tickers` Accesses Private State (Severity: Low)
+The real risk is downstream: once this module is wired into the FastAPI app
+(the next piece of work per `PLAN.md` §13 "Still open"), any test that builds
+the app more than once per process — a very common pytest pattern (an `app`
+fixture instantiated per test, or per module) — will silently accumulate
+duplicate routes on every rebuild, since `router`/`history_router` are shared
+mutable module state that outlives any single app instance.
 
-`simulator.py:254`:
+**Fix:** construct a new `APIRouter()` inside each factory function instead of
+reusing a module-level instance:
+
 ```python
-def get_tickers(self) -> list[str]:
-    return list(self._sim._tickers) if self._sim else []
+def create_stream_router(price_cache: PriceCache) -> APIRouter:
+    router = APIRouter(prefix="/api/stream", tags=["streaming"])
+
+    @router.get("/prices")
+    async def stream_prices(request: Request) -> StreamingResponse:
+        ...
+    return router
 ```
 
-This reaches into `GBMSimulator._tickers` (private attribute). `GBMSimulator` should expose a `get_tickers()` method or a `tickers` property to keep the boundary clean.
+### 3.2 `PriceCache.update()` treats a falsy timestamp as "no timestamp given" (Severity: Low)
 
-### 3.6 Module-Level Router Instance (Severity: Low)
+```python
+ts = timestamp or time.time()
+```
 
-`stream.py:16` creates a module-level `router` object, and `create_stream_router()` registers a route on it via closure. If `create_stream_router` were called twice (e.g., in tests), the `/prices` route would be registered twice on the same router. In practice this won't happen because the function is called once during app startup, but it's a latent footgun for testing.
+(`cache.py:40`) A caller that explicitly passes `timestamp=0.0` (Unix epoch,
+1970-01-01) gets `time.time()` substituted instead, because `0.0` is falsy.
+No current caller does this — `massive_client.py` only reaches this path with
+`time.time()` already substituted upstream when `sip_timestamp` is falsy — so
+this is not exploitable today, but it is a latent correctness gap for any
+future caller (e.g., a test replaying historical data from epoch-adjacent
+timestamps, or a backfill script). Prefer `timestamp if timestamp is not None
+else time.time()`.
 
-### 3.7 Unused Imports in Tests (Severity: Trivial)
+### 3.3 `MassiveDataSource`'s poller task dies silently on `AuthError` (Severity: Low)
 
-Five lint warnings from `ruff`:
-- `test_cache.py`: unused `pytest`
-- `test_factory.py`: unused `pytest`
-- `test_massive.py`: unused `asyncio`
-- `test_simulator.py`: unused `math`, unused `pytest`
+`_poll_once()` deliberately re-raises `AuthError` (`massive_client.py:103-105`)
+with the comment "unrecoverable: do not retry on a loop" — a reasonable
+choice. But the only place that awaits `self._task` is `stop()`
+(`massive_client.py:60-69`), which nothing calls until shutdown. If the key
+is revoked *after* `start()` succeeds (rather than being bad from the first
+poll), the background task raised inside `_poll_loop()` simply stops running;
+asyncio logs "Task exception was never retrieved" at some later point (often
+at garbage collection, easy to miss in container logs), and the app has no
+other signal that live prices have silently frozen. `test_auth_error_propagates`
+confirms the exception propagates out of `_poll_once()`, but there is no test
+for what happens to `_poll_loop()` or the app once that happens.
+
+This is fine as coded for now since nothing outside the market module reads
+task health yet, but whoever wires this into the app (`PLAN.md` §13, item 3)
+should either attach a `Task.add_done_callback` that logs loudly / flips a
+health flag, or have `GET /api/health` report `market_source` as degraded
+when the task is dead. Worth a one-line note in `MARKET_DATA_SUMMARY.md` so
+it isn't forgotten during integration.
+
+### 3.4 `PriceCache.version` property reads outside the lock (Severity: Trivial)
+
+Unchanged from the archived review's §3.4: `cache.py:94-97` reads `self._version`
+without acquiring `self._lock`. Safe under CPython's GIL for a single `int`
+read, inconsistent with the rest of the class, and only a real concern on a
+no-GIL build. Not worth blocking on, but a two-line fix if anyone is passing
+through this file for another reason.
+
+### 3.5 `market_data_demo.py` and `backend/README.md` are outside the reviewed test scope but were not separately verified
+
+The demo script (`market_data_demo.py`, 205 lines) is referenced by
+`MARKET_DATA_SUMMARY.md` as a manual verification tool and has no automated
+test coverage, which is appropriate for a Rich terminal demo — flagging only
+so it's clear this review's "all tests pass" scope is `backend/tests/market/`,
+not the demo script.
 
 ---
 
-## 4. Design Observations
+## 4. Test Suite Assessment (by module)
 
-### 4.1 Things Done Well
+| Module | File | Assessment |
+|---|---|---|
+| `models.py` | `test_models.py` (11 tests) | Complete: creation, `change`/`change_percent`/`direction` in both directions, zero-previous-price edge case, `to_dict()` shape, and frozen-dataclass immutability. No gaps. |
+| `cache.py` | `test_cache.py` (24 tests) | Thorough. Covers direction transitions, `version` monotonicity, `__len__`/`__contains__`, price rounding, custom timestamps, and a dedicated `TestPriceHistory` class covering bounding, ordering, per-ticker isolation, limit-narrower-than-stored, and that `remove()` clears history without touching other tickers. No test for concurrent multi-thread writes (the lock is exercised only single-threaded) — the archived review flagged this as missing in §4.2 and it remains missing; low priority since the logic is simple enough to verify by inspection. |
+| `interface.py` | (no dedicated file; exercised transitively via simulator/massive tests) | Reasonable — it's an ABC with no logic of its own. |
+| `seed_prices.py` | `test_simulator.py`, `test_factory.py` (transitively) | No dedicated test file, but every constant is exercised indirectly through `GBMSimulator` tests (`_pairwise_correlation` tests cover tech/finance/TSLA/cross-sector explicitly). Fine given it's pure data. |
+| `simulator.py` | `test_simulator.py` (17), `test_simulator_source.py` (10) | Strong. `GBMSimulator`: positivity over 10,000 steps, seed matching, add/remove (including duplicate/nonexistent no-ops), unknown-ticker random seeding, Cholesky construction/teardown on ticker count crossing 1↔2, all four correlation branches, `dt` sanity, and rounding. `SimulatorDataSource`: cache population on start, periodic updates via real `asyncio.sleep`, idempotent stop, dynamic add/remove, empty-start, and exception resilience. The timing-based assertions (`asyncio.sleep(0.3)` then assert version advanced) are inherently a little flaky under CI load, but the margins used (3-6x the interval) are generous enough to be low-risk. |
+| `massive_client.py` | `test_massive.py` (17) | Strong, and specifically hardened against the exact bug class that shipped previously — `_apply_snapshots` is tested against real `TickerSnapshot.from_dict(...)` objects, not mocks, for timestamp conversion, missing-trade skipping, mixed valid/invalid batches, and multi-ticker updates. Polling lifecycle covers success, `BadResponse` (swallowed), `AuthError` (re-raised, see §3.3), generic exceptions (swallowed), ticker add/remove with normalization, and start/stop idempotency. No gap of consequence. |
+| `stream.py` | `test_stream.py` (15) | Was 31% covered and untested in the archived review; now has direct coverage of the async generator via a hand-rolled `FakeRequest`, including the retry directive, snapshot-on-connect (and thus reconnect), the frozen payload field set, keepalive timing (via `monkeypatch` on `KEEPALIVE_SECONDS` rather than a real 15s wait — good practice), a fresh data event following a ping, disconnect handling, and the empty-cache case. `create_history_router`'s endpoint is tested for ordering, unknown-ticker empty response, normalization, and limit clamping in both directions. The one real gap is architectural, not a missing test: see §3.1 — the tests would catch a *regression* in behavior but not the router-reuse issue itself, since grabbing `routes[-1]` happens to paper over it. |
+| `factory.py` | `test_factory.py` (7) | Complete for its size: unset/empty/whitespace-only key → simulator, set key → Massive, and that both branches thread the cache reference through correctly. |
 
-- **GBM parameter tuning is thoughtful.** TSLA at sigma=0.50 vs V at 0.17 reflects real-world volatility differences. The shock event system (~0.1% per tick, producing visible moves every ~50s) adds visual drama without destabilizing prices.
-- **Cholesky decomposition for correlated moves** is the mathematically correct approach. The sector-based correlation structure (tech 0.6, finance 0.5, cross 0.3) is reasonable.
-- **Defensive error handling in both data sources.** Both `_run_loop` (simulator) and `_poll_once`/`_poll_loop` (massive) catch exceptions and continue, which is essential for a long-running background service.
-- **SSE implementation is clean.** The version-based change detection avoids sending redundant payloads. The `retry: 1000\n\n` directive ensures browser auto-reconnect. Nginx buffering is proactively disabled.
-- **Seed prices in the cache at start** means the frontend gets data on the first SSE poll, with no visible delay.
-- **Thread-safe cache with Lock** is the right choice since the Massive client runs API calls via `asyncio.to_thread`.
-
-### 4.2 Missing Tests
-
-- **SSE streaming (`stream.py`)** at 31% coverage has no dedicated tests. Testing SSE requires an ASGI test client (e.g., `httpx.AsyncClient` with `app`). Given that this is the primary consumer of PriceCache, even a basic integration test would add confidence.
-- **No concurrent/thread-safety test for PriceCache.** The lock usage looks correct from inspection, but a test with multiple threads writing simultaneously would verify it empirically.
-- **No test for `GBMSimulator` with all 10 default tickers.** Tests use 1-2 tickers. A test confirming the Cholesky decomposition succeeds for the full 10-ticker default set would catch correlation matrix issues.
-
-### 4.3 Potential Future Considerations
-
-- The `PriceCache` doesn't cap history; it only stores the latest price per ticker, so memory is bounded at O(tickers). Good.
-- The `DEFAULT_CORR` constant (0.3, `seed_prices.py:48`) is defined but never referenced in `_pairwise_correlation`. The static method returns `CROSS_GROUP_CORR` (also 0.3) as the fallback. This is semantically confusing — `DEFAULT_CORR` seems intended for tickers not in any group, but the code returns `CROSS_GROUP_CORR` for all non-matched pairs. Both happen to be 0.3, so behavior is correct, but the naming is misleading.
+**Net assessment:** the suite is comprehensive and, importantly, methodologically
+careful — the deliberate choice to build real `TickerSnapshot` objects instead of
+`MagicMock` in `test_massive.py` is the single best thing about this test suite,
+since it's precisely what would have caught the `last_trade.timestamp` /
+`sip_timestamp` bug the archived review found. No test was found asserting
+something the source doesn't do, and no source behavior of consequence lacks a
+test, with the caveats above (concurrency, and the router-reuse issue masked
+by test ordering).
 
 ---
 
-## 5. Verdict
+## 5. Comparison Against the Prior Review
 
-The market data backend is solid and well-structured. The GBM simulator, price cache, abstract interface, factory pattern, and SSE streaming all work correctly and follow good practices. The architecture will integrate cleanly with the rest of the application.
+`planning/archive/MARKET_DATA_REVIEW.md` (2026-02-10) recorded 7 issues. Status now:
 
-**Must fix before proceeding:**
-1. Add `[tool.hatch.build.targets.wheel] packages = ["app"]` to `pyproject.toml` — without this, `uv sync` and Docker builds fail.
+| # | Issue | Status |
+|---|---|---|
+| 3.1 | Missing hatchling wheel config | **Fixed** |
+| 3.2 | Massive tests fragile without the `massive` package | **Fixed** (now a core dependency, imported at module level) |
+| 3.3 | `_generate_events` return type `-> None` instead of `AsyncGenerator` | **Fixed** (`stream.py:87`) |
+| 3.4 | `PriceCache.version` reads outside the lock | **Still open** (§3.4 above, trivial) |
+| 3.5 | `SimulatorDataSource.get_tickers` reached into `GBMSimulator._tickers` | **Fixed** — `GBMSimulator.get_tickers()` now exists (`simulator.py:140-142`) and is used |
+| 3.6 | Module-level router registered on repeated calls | **Still open, and now demonstrated by the test suite itself** (§3.1 above, upgraded to Medium given it will bite during app integration) |
+| 3.7 | Unused imports in tests | **Fixed** — no unused `pytest`/`math`/`asyncio` imports found in any current test file |
 
-**Should fix:**
-2. Make the Massive tests resilient to the `massive` package being absent (use `create=True` on patches, or restructure mocks).
-3. Fix the `_generate_events` return type annotation.
-4. Remove unused imports in test files.
+Also confirmed fixed: the two Massive parsing defects `MARKET_DATA_DESIGN.md`
+§8.4 described (wrong attribute name, nanosecond/millisecond confusion), and
+all three items `PLAN.md` §13 listed as open TODOs (rolling history, `/history`
+endpoint, SSE keepalive).
 
-**Nice to have:**
-5. Add a `get_tickers()` public method to `GBMSimulator`.
-6. Add at least one SSE integration test.
-7. Clarify `DEFAULT_CORR` vs `CROSS_GROUP_CORR` naming.
+---
+
+## 6. Verdict
+
+The market data backend is in good shape and ready to be built on. Of the two
+open items:
+
+- **§3.1 (shared module-level router)** should be fixed before the FastAPI
+  `lifespan` wiring work begins (`PLAN.md` §13, item 3) — it's a small,
+  mechanical fix (stop reusing module-level `router`/`history_router`; build
+  one per call) and doing it now avoids a confusing bug later when the app
+  factory is instantiated more than once, which is standard practice for
+  backend test fixtures.
+- **§3.2/§3.4 (falsy-timestamp substitution, unlocked version read)** are
+  low-risk and can be picked up opportunistically.
+- **§3.3 (silent poller death on revoked key)** is a design note for whoever
+  adds the `GET /api/health` endpoint — surface poller liveness there.
+
+None of these block downstream work. **Tests were not executed in this pass**
+due to environment permissions (§1) — that is the one action item this review
+could not complete, and it should be re-run with `uv`/`python3` execution
+permitted to get an authoritative pass/fail/coverage number rather than the
+static analysis this document is based on.
