@@ -49,7 +49,7 @@ MarketDataSource (ABC)
 
 ## Gaps Closed
 
-`planning/MARKET_DATA_DESIGN.md` §0 recorded four outstanding gaps against the code as it stood
+`planning/archive/MARKET_DATA_DESIGN.md` §0 recorded four outstanding gaps against the code as it stood
 on 2026-09-01. All four are now closed:
 
 1. **Massive client wrote nothing to the cache.** `last_trade.timestamp` does not exist on the
